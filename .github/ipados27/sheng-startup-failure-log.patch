@@ -1,0 +1,27 @@
+From c8f92b208068eeaa4cd2b0f592671f04ee70076e Mon Sep 17 00:00:00 2001
+From: UniXNU Build Bot <build@unixnu.local>
+Date: Mon, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH] sheng: fix startup failure log anchor
+
+Fix the patch anchor to use .orig file for proper application.
+
+---
+ platform/apple/startup.c.orig | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/platform/apple/startup.c.orig b/platform/apple/startup.c.orig
+index a1b2c3d..e4f5g6h 100644
+--- a/platform/apple/startup.c.orig
++++ b/platform/apple/startup.c
+@@ -42,6 +42,8 @@ void platform_startup(void)
+     platform_console_init();
+     platform_clock_init();
+ 
++    printf("sheng: startup failure logging enabled\n");
++    platform_failure_log_init();
+     
+     if (platform_is_simulator()) {
+         simulator_early_init();
+ 
+-- 
+2.45.0

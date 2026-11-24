@@ -1,0 +1,248 @@
+name: iPadOS 27 Persistent Install (sheng)
+
+on:
+  workflow_dispatch:
+    inputs:
+      device_ref:
+        description: UniXNU-sheng ref
+        required: true
+        type: string
+        default: "c8f92b208068eeaa4cd2b0f592671f04ee70076e"
+      core_ref:
+        description: UniXNU core ref (with release/runtime support)
+        required: true
+        type: string
+        default: "563595abedfdfa413ad583b66b6176d82007e633"
+      uefi_ref:
+        description: uefi-sheng ref
+        required: true
+        type: string
+        default: "b303410c8e401fc9419ae65a024356ed09a438ef"
+      init_data:
+        description: Create NEW Data seed (first install only)
+        required: true
+        type: boolean
+        default: false
+      publish_release:
+        description: Publish artifacts as Release
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ipados27-persistent-${{ github.ref }}-${{ inputs.device_ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 420
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+
+    steps:
+      - name: Checkout workflow repo (contains patchers & verifier)
+        uses: actions/checkout@v4
+        with:
+          path: build
+          persist-credentials: false
+
+      - name: Checkout device sources (pinned with submodules)
+        uses: actions/checkout@v4
+        with:
+          repository: UniXNU/UniXNU-sheng
+          ref: ${{ inputs.device_ref }}
+          path: device
+          submodules: recursive
+          token: ${{ github.token }}
+
+      - name: Checkout UniXNU core (pinned, has release/runtime)
+        uses: actions/checkout@v4
+        with:
+          repository: UniXNU/UniXNU
+          ref: ${{ inputs.core_ref }}
+          path: UniXNU
+          submodules: recursive
+          token: ${{ github.token }}
+
+      - name: Checkout UEFI firmware (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: UniXNU/uefi-sheng
+          ref: ${{ inputs.uefi_ref }}
+          path: uefi-sheng
+          submodules: recursive
+          token: ${{ github.token }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install host toolchain
+        run: |
+          brew install dtc llvm lld cmake mtools ninja glslang shaderc spirv-tools bison pkgconf rustup blacktop/tap/ipsw
+          {
+            echo "$HOME/.cargo/bin"
+            echo "$(brew --prefix llvm)/bin"
+            echo "$(brew --prefix lld)/bin"
+            echo "$(brew --prefix bison)/bin"
+          } >> "$GITHUB_PATH"
+          rustup toolchain install 1.98.0 --profile minimal --component rust-src
+          rustup default 1.98.0
+
+      - name: Report toolchain versions
+        run: |
+          set -e
+          echo "device: $(git -C device rev-parse HEAD)  $(git -C device log -1 --format=%s)"
+          echo "core:   $(git -C UniXNU rev-parse HEAD)  $(git -C UniXNU log -1 --format=%s)"
+          echo "uefi:   $(git -C uefi-sheng rev-parse HEAD)"
+          test -f device/board.toml || { echo "::error::missing board.toml"; exit 1; }
+          ls device/configs/
+          for t in clang xcodebuild make ninja cmake dtc fdtget fdtput mtools mcopy ipsw rustc cargo compression_tool aea; do
+            printf '%-20s %s\n' "$t" "$(command -v "$t" || echo MISSING)"
+          done
+          xcodebuild -version
+          df -h "$GITHUB_WORKSPACE"
+
+      - name: Apply device compatibility patches (QcomGeniSpi + startup log anchor)
+        working-directory: device
+        run: |
+          set -e
+          python3 "$GITHUB_WORKSPACE/build/.github/ipados27/prepare-device.py" .
+
+      - name: Apply driver iOS guards (Adreno pager + RamBlock mfree)
+        working-directory: .
+        run: |
+          set -e
+          python3 "$GITHUB_WORKSPACE/build/.github/ipados27/prepare-drivers.py" device
+
+      - name: Apply translator iOS compatibility (metal2vulkan host_memory)
+        working-directory: .
+        run: |
+          set -e
+          python3 "$GITHUB_WORKSPACE/build/.github/ipados27/prepare-translator.py" UniXNU
+
+      - name: Prepare FreeBSD sources for Ath12kWifi
+        working-directory: device
+        run: |
+          set -e
+          python3 scripts/extract-files.py
+          python3 "$GITHUB_WORKSPACE/build/.github/ipados27/tools-prepare-freedsb.py" .
+          python3 drivers/Ath12kWifi/tools/fetch-sources.py
+          ls -la drivers/Ath12kWifi/deps/
+
+      - name: Verify platform seed
+        env:
+          UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
+        run: |
+          test -n "$UNIXNU_UNIQUE_CHIP_ID" || { echo "::error::Set the UNIXNU_UNIQUE_CHIP_ID secret (8 hex digits)"; exit 1; }
+          echo "seed length ${#UNIXNU_UNIQUE_CHIP_ID}"
+
+      - name: Run full release build (kernel + package + firmware + payload + userdata + verify)
+        id: release
+        working-directory: device
+        env:
+          UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          args=(--os 27 --uefi ../uefi-sheng)
+          if [ "${{ inputs.init_data }}" = "true" ]; then
+            args+=(--init-data)
+          fi
+          # Persistent boot: take over firmware's 30s Gunyah watchdog
+          args+=(--kernel-arg uefi-watchdog=1)
+          echo "package.sh ${args[*]}"
+          ../UniXNU/unixnu release "${args[@]}"
+
+      - name: Build userdata-root.img (OS + SystemOS + root policies)
+        id: userdata
+        working-directory: device
+        env:
+          UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
+        run: |
+          set -e
+          python3 ../UniXNU/scripts/unixnu/cli.py userdata build \
+            -D . --os 27 --init-data false \
+            --unique-chip-id "$UNIXNU_UNIQUE_CHIP_ID" \
+            --uefi ../uefi-sheng
+          # Also create the sparse installer image
+          python3 ../UniXNU/scripts/unixnu/cli.py userdata build \
+            -D . --os 27 --init-data false \
+            --unique-chip-id "$UNIXNU_UNIQUE_CHIP_ID" \
+            --uefi ../uefi-sheng \
+            --output build/userdata-root-sparse.img
+
+      - name: Verify persistent image properties
+        working-directory: .
+        run: |
+          set -e
+          python3 "$GITHUB_WORKSPACE/build/.github/ipados27/verify-image.py" .
+
+      - name: Collect all artifacts
+        if: always()
+        run: |
+          mkdir -p out-artifacts
+          # Release artifacts
+          for n in boot.img payload.img kernel.macho package.manifest.json; do
+            find UniXNU/out -maxdepth 6 -type f -name "$n" -exec cp -v {} out-artifacts/ \; || true
+          done
+          # Userdata artifacts
+          for n in userdata-root.img userdata-root.json userdata-root-sparse.img; do
+            find UniXNU/out -maxdepth 6 -type f -name "$n" -exec cp -v {} out-artifacts/ \; || true
+          done
+          # Runtime seed
+          find UniXNU/out -maxdepth 6 -type f -name "data.dbr" -exec cp -v {} out-artifacts/ \; || true
+          find UniXNU/out -maxdepth 6 -type f -name "inputs.json" -exec cp -v {} out-artifacts/ \; || true
+          ls -lh out-artifacts/
+          (cd out-artifacts && shasum -a 256 * > SHA256SUMS.txt 2>/dev/null && cat SHA256SUMS.txt) || true
+
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sheng-ipados27-persistent
+          path: out-artifacts/
+          compression-level: 0
+          retention-days: 30
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            UniXNU/out/sheng/*/*/logs/*.log
+            device/out/sheng/*/*/logs/*.log
+          retention-days: 14
+
+      - name: Publish Release with all install images
+        if: inputs.publish_release && success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          cd out-artifacts
+          ls -1
+          TAG="sheng-ipados27.0.1-persistent-$(date +%Y%m%d-%H%M%S)"
+          gh release create "$TAG" * \
+            --repo "${{ github.repository }}" \
+            --title "sheng iPadOS 27 persistent-boot images ($TAG)" \
+            --notes "device UniXNU-sheng@$(git -C ../device rev-parse --short HEAD), core UniXNU@$(git -C ../UniXNU rev-parse --short HEAD), uefi uefi-sheng@$(git -C ../uefi-sheng rev-parse --short HEAD).
+Contains: boot.img (192 MiB boot_b), payload.img, kernel.macho, userdata-root.img (OS+SystemOS+root-policies), userdata-root-sparse.img (sparse installer), package.manifest.json, data.dbr (seed), SHA256SUMS.txt.
+Flash sequence:
+  fastboot flash userdata userdata-root.img
+  fastboot flash boot_b boot.img
+  fastboot set_active b
+# For sparse installer (first boot): flash userdata-root-sparse.img instead.
+Root policies baked into userdata; uefi-watchdog=1 for persistent boot; no autoreset=."
+
+      - name: Clean up proprietary inputs
+        if: always()
+        run: |
+          rm -rf UniXNU/out/ipsw UniXNU/out/feeds device/.cache/firmware 2>/dev/null || true

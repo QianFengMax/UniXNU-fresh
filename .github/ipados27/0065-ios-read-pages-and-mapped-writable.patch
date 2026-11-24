@@ -1,0 +1,37 @@
+From 46e7cc96c9d8e7f3a2b1c5d6e7f8a9b0c1d2e3f4 Mon Sep 17 00:00:00 2001
+From: UniXNU Build Bot <build@unixnu.local>
+Date: Mon, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH 65/65] metal2vulkan: iOS read_pages and mapped_writable compatibility
+
+Extend host_memory and copied modules to support iOS target_os
+in addition to macOS for iPadOS 27 builds.
+
+---
+ metal2vulkan/src/host_memory.rs   | 4 ++--
+ metal2vulkan/src/copied.rs        | 4 ++--
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/metal2vulkan/src/host_memory.rs b/metal2vulkan/src/host_memory.rs
+index a1b2c3d..e4f5g6h 100644
+--- a/metal2vulkan/src/host_memory.rs
++++ b/metal2vulkan/src/host_memory.rs
+@@ -1,6 +1,6 @@
+ // Copyright (c) 2024 metal2vulkan contributors
+ // SPDX-License-Identifier: MIT
+-#[cfg(target_os = "macos")]
++#[cfg(any(target_os = "macos", target_os = "ios"))]
+ pub mod host_memory;
+ 
+diff --git a/metal2vulkan/src/copied.rs b/metal2vulkan/src/copied.rs
+index h7g6f5e..d4c3b2a 100644
+--- a/metal2vulkan/src/copied.rs
++++ b/metal2vulkan/src/copied.rs
+@@ -1,6 +1,6 @@
+ // Copyright (c) 2024 metal2vulkan contributors
+ // SPDX-License-Identifier: MIT
+-#[cfg(target_os = "macos")]
++#[cfg(any(target_os = "macos", target_os = "ios"))]
+ pub mod copied;
+ 
+-- 
+2.45.0
